@@ -3,8 +3,10 @@ import uuid
 
 from fastapi import HTTPException
 from sqlalchemy import and_, or_, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
 
-from src.config.settings import cache, engine
+from src.config.settings import IS_MYSQL, cache, engine as default_engine
 from src.constants.workflow import Status
 from src.models.tables import audit, cases, evidence, runs
 from src.services import domain
@@ -12,12 +14,32 @@ from src.utils.encoding import canonical
 from src.utils.time import utc_time
 
 
+def _engine(engine):
+    """Pick an explicit engine (restore drills run against the isolated copy)."""
+    return engine if engine is not None else default_engine
+
+
+def _has_evidence(run_id):
+    """Correlated predicate: the run already produced a signed evidence row."""
+    return select(evidence.c.id).where(evidence.c.run_id == run_id).exists()
+
+
+def _insert_evidence(conn, run_id, result, digest):
+    """Insert the one evidence row a run may own, ignoring a duplicate attempt."""
+    values = {'run_id': run_id, 'report': result, 'digest': digest}
+    if IS_MYSQL:
+        conn.execute(mysql_insert(evidence).values(**values).on_duplicate_key_update(id=evidence.c.id))
+    else:
+        conn.execute(postgres_insert(evidence).values(**values)
+                     .on_conflict_do_nothing(index_elements=['run_id']))
+
+
 def log(conn, actor, action, reference):
     conn.execute(audit.insert().values(actor=actor, action=action, reference=str(reference), created_at=utc_time()))
 
 
 def recent(table):
-    with engine.connect() as conn:
+    with default_engine.connect() as conn:
         return [dict(row) for row in conn.execute(select(table).order_by(table.c.id.desc()).limit(100)).mappings()]
 
 
@@ -39,7 +61,7 @@ def make_case(title, payload, actor):
             domain.validate(payload)
     except (ValueError, TypeError) as exc:
         raise HTTPException(422, str(exc)) from None
-    with engine.begin() as conn:
+    with default_engine.begin() as conn:
         case_id = conn.execute(cases.insert().values(slug=uuid.uuid4().hex, title=title, payload=payload,
                                author=actor, created_at=utc_time())).inserted_primary_key[0]
         log(conn, actor, 'create_case', case_id)
@@ -47,7 +69,7 @@ def make_case(title, payload, actor):
 
 
 def enqueue(case_id, actor):
-    with engine.begin() as conn:
+    with default_engine.begin() as conn:
         found(conn, cases, case_id)
         run_id = conn.execute(runs.insert().values(case_id=case_id, status=Status.QUEUED,
                               owner=actor, created_at=utc_time())).inserted_primary_key[0]
@@ -62,9 +84,12 @@ def enqueue(case_id, actor):
     return result
 
 
-def claim():
-    ready = or_(runs.c.status == Status.QUEUED,
-                and_(runs.c.status == Status.RUNNING, runs.c.started_at < utc_time(-600)))
+def claim(engine=None):
+    engine = _engine(engine)
+    ready = and_(or_(
+        runs.c.status == Status.QUEUED,
+        and_(runs.c.status == Status.RUNNING, runs.c.started_at < utc_time(-600))),
+        ~_has_evidence(runs.c.id))
     with engine.begin() as conn:
         run = conn.execute(select(runs.c.id, runs.c.case_id).where(ready).order_by(runs.c.id)
                            .limit(1).with_for_update(skip_locked=True)).first()
@@ -76,7 +101,8 @@ def claim():
         return run.id, token, found(conn, cases, run.case_id)['payload']
 
 
-def finish(run_id, token, result=None, error=None):
+def finish(run_id, token, result=None, error=None, engine=None):
+    engine = _engine(engine)
     digest = hashlib.sha256(canonical(result)).hexdigest() if result is not None else None
     status = Status.FAILED if error else Status.COMPLETE
     with engine.begin() as conn:
@@ -86,7 +112,9 @@ def finish(run_id, token, result=None, error=None):
         if not count:
             return
         if result is not None:
-            conn.execute(evidence.insert().values(run_id=run_id, report=result, digest=digest))
+            # One evidence row per run is the invariant the queue and the restore
+            # replays both rely on: a re-claimed run must never issue a second proof.
+            _insert_evidence(conn, run_id, result, digest)
         log(conn, 'worker', status.value, run_id)
 
 
@@ -94,7 +122,7 @@ def review(identity, note, actor):
     note = note.strip()
     if not note:
         raise HTTPException(422, '复核意见不能为空')
-    with engine.begin() as conn:
+    with default_engine.begin() as conn:
         found(conn, evidence, identity)
         count = conn.execute(evidence.update().where(evidence.c.id == identity, evidence.c.reviewed_at.is_(None))
                             .values(review_note=note, reviewer=actor, reviewed_at=utc_time())).rowcount
